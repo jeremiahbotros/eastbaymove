@@ -2,7 +2,8 @@
 // Calls the RentCast valuation API server-side (key never reaches the browser), then:
 //  - keeps only truly comparable homes: within 1 mile, listed in the last 12 months,
 //    ±1 bed, ±1 bath, ±20% living area, ±15 years built (widens to 1.5 mi / 18 months if needed)
-//  - sets a conservative value: the lower of RentCast's estimate and the comps' median price per sq ft
+//  - sets a conservative value: prefers off-market (likely sold) comps over asking prices, drops outliers,
+//    credits size differences at half weight, takes the lower of RentCast and the comps, then shaves 3%
 // Setup: Netlify > Site configuration > Environment variables > RENTCAST_API_KEY.
 
 const json = (body, status = 200, extra = {}) =>
@@ -57,16 +58,25 @@ export default async (req) => {
   if (!res || !res.data) return json({ error: 'lookup_failed', status: res && res.error }, res && res.error === 404 ? 404 : 502);
 
   const d = res.data, sp = d.subjectProperty || {};
-  const top = comps.slice(0, 6);
-  const ppsf = top.filter(c => c.squareFootage).map(c => c.price / c.squareFootage);
-  const compValue = sp.squareFootage && ppsf.length >= 2 ? median(ppsf) * sp.squareFootage : 0;
-  // Conservative: never above RentCast's estimate; pulled down to the comps when they say lower.
-  const value = round5k(compValue ? Math.min(d.price, compValue) : d.price);
-  const low = round5k(Math.min(d.priceRangeLow || value * 0.95, value * 0.95));
-  const high = round5k(Math.max(value * 1.04, Math.min(d.priceRangeHigh || value * 1.06, value * 1.08)));
-
+  // 1) Prefer homes that have left the market (likely sold) over current asking prices.
+  const closed = comps.filter(c => c.status === 'Inactive');
+  let pool = closed.length >= 3 ? closed : comps.map(c => c.status === 'Active' ? Object.assign({}, c, { adjPrice: c.price * 0.97 }) : c);
+  pool = pool.map(c => Object.assign({ adjPrice: c.price }, c));
+  // 2) Drop outliers more than 15% from the group's median price.
+  const mid = median(pool.map(c => c.adjPrice));
+  pool = pool.filter(c => c.adjPrice >= mid * 0.85 && c.adjPrice <= mid * 1.15);
+  const top = pool.slice(0, 6);
+  // 3) Size adjustment at half weight (extra square footage doesn't add value one-for-one).
+  const adjusted = top.filter(c => c.squareFootage && sp.squareFootage)
+    .map(c => c.adjPrice + (sp.squareFootage - c.squareFootage) * (c.adjPrice / c.squareFootage) * 0.5);
+  const compValue = adjusted.length >= 2 ? median(adjusted) : (top.length >= 2 ? median(top.map(c => c.adjPrice)) : 0);
+  // 4) Conservative: the lower of RentCast and the comps, less 3%.
+  const base = compValue ? Math.min(d.price, compValue) : d.price;
+  const value = round5k(base * 0.97);
+  const low = round5k(value * 0.94);
+  const high = round5k(value * 1.04);
   return json({
-    value, low, high, avm: d.price, method: compValue && compValue < d.price ? 'comps' : 'avm', compTier: tier,
+    value, low, high, avm: d.price, compValue: Math.round(compValue), method: 'conservative', compTier: tier, closedComps: closed.length >= 3,
     beds: sp.bedrooms, baths: sp.bathrooms, sqft: sp.squareFootage, lot: sp.lotSize, yearBuilt: sp.yearBuilt,
     propertyType: sp.propertyType, lastSalePrice: sp.lastSalePrice, lastSaleDate: sp.lastSaleDate, city: sp.city, zip: sp.zipCode,
     comps: top.map(c => ({
