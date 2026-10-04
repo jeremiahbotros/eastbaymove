@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://eastbaymove.netlify.app/sitemap.xml
