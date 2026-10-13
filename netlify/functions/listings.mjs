@@ -1,10 +1,45 @@
-// Active for-sale listings for the "Your Next Move" plan page (RentCast /listings/sale).
-// Uses the same RENTCAST_API_KEY. Each search is cached on Netlify's CDN for 12 hours
-// so repeat visits don't use extra lookups.
-//   GET /api/listings?city=Brentwood&max=1200000&beds=3&baths=2&type=Single Family Home
+// Every home for sale right now in one city, for the "Your Next Move" plan page (RentCast /listings/sale).
+//   GET /api/listings?city=Brentwood&beds=3&baths=2&type=Single Family Home
+// - Runs ONLY when a visitor scrolls to "Homes that fit" or taps a city. Nothing runs on a schedule.
+// - Pulls all active listings for the city (500 per lookup), then drops anything RentCast hasn't
+//   seen on the market in the last 3 days (sold / pending / pulled).
+// - Each city is fetched at most once a day (RentCast itself updates daily); every visitor that day
+//   shares that copy via Netlify Blobs. Sliders and filters run in the browser and cost nothing.
+// - Optional Netlify variables: LISTINGS_TTL_MIN (default 1440 = 24h), LISTINGS_MAX_PAGES (default 1).
+import { getStore } from '@netlify/blobs';
+
 const json = (body, status = 200, extra = {}) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...extra } });
 const TYPES = { 'Single Family Home': 'Single Family', 'Condo': 'Condo', 'Townhouse': 'Townhouse' };
+const DAY = 86400000;
+
+async function fetchAll(key, city, type, beds) {
+  const pages = Math.min(5, Math.max(1, parseInt(process.env.LISTINGS_MAX_PAGES) || 1));
+  let all = [];
+  for (let i = 0; i < pages; i++) {
+    const q = new URLSearchParams({ city, state: 'CA', status: 'Active', limit: '500', offset: String(i * 500) });
+    if (type) q.set('propertyType', type);
+    if (beds) q.set('bedrooms', `${beds}:*`);
+    const r = await fetch('https://api.rentcast.io/v1/listings/sale?' + q, { headers: { 'X-Api-Key': key, accept: 'application/json' } });
+    if (!r.ok) { if (i === 0) throw new Error('rentcast ' + r.status); break; }
+    const page = await r.json();
+    if (!Array.isArray(page)) break;
+    all = all.concat(page);
+    if (page.length < 500) break;
+  }
+  const now = Date.now(), seen = new Set();
+  return all.filter(x => {
+    if (!x.price || !x.formattedAddress || x.status !== 'Active' || x.removedDate) return false;
+    if (x.lastSeenDate && now - Date.parse(x.lastSeenDate) > 3 * DAY) return false;
+    const k = String(x.formattedAddress).toLowerCase(); if (seen.has(k)) return false; seen.add(k);
+    return true;
+  }).map(x => ({
+    id: x.id, address: x.formattedAddress, line1: x.addressLine1 || String(x.formattedAddress).split(',')[0], city: x.city, zip: x.zipCode,
+    price: x.price, beds: x.bedrooms, baths: x.bathrooms, sqft: x.squareFootage, lot: x.lotSize, year: x.yearBuilt, type: x.propertyType,
+    dom: x.daysOnMarket, listed: x.listedDate, lat: x.latitude, lon: x.longitude, hoa: x.hoa && x.hoa.fee, lastSeen: x.lastSeenDate,
+    office: x.listingOffice && x.listingOffice.name, mls: x.mlsNumber
+  }));
+}
 
 export default async (req) => {
   const url = new URL(req.url);
@@ -17,30 +52,25 @@ export default async (req) => {
 
   const city = (url.searchParams.get('city') || '').trim().slice(0, 60);
   if (!/^[A-Za-z .'-]{2,60}$/.test(city)) return json({ error: 'invalid_city' }, 400);
-  const max = Math.min(50000000, Math.max(100000, Math.round(Number(url.searchParams.get('max')) / 50000) * 50000 || 1000000));
   const beds = Math.min(10, Math.max(0, parseInt(url.searchParams.get('beds')) || 0));
   const baths = Math.min(10, Math.max(0, Math.floor(Number(url.searchParams.get('baths')) || 0)));
   const type = TYPES[url.searchParams.get('type')] || '';
+  const ttl = Math.max(5, parseInt(process.env.LISTINGS_TTL_MIN) || 1440) * 60000;
 
-  const q = new URLSearchParams({ city, state: 'CA', status: 'Active', price: `100000:${max}`, limit: '24' });
-  if (beds) q.set('bedrooms', `${beds}:*`);
-  if (baths) q.set('bathrooms', `${baths}:*`);
-  if (type) q.set('propertyType', type);
-
-  let r;
-  try { r = await fetch('https://api.rentcast.io/v1/listings/sale?' + q, { headers: { 'X-Api-Key': key, accept: 'application/json' } }); }
-  catch (_) { return json({ error: 'lookup_failed' }, 502); }
-  if (!r.ok) return json({ error: 'lookup_failed', status: r.status }, 502);
-  const list = await r.json();
-  const listings = (Array.isArray(list) ? list : []).filter(x => x.price && x.formattedAddress).map(x => ({
-    id: x.id, address: x.formattedAddress, line1: x.addressLine1 || String(x.formattedAddress).split(',')[0], city: x.city, zip: x.zipCode,
-    price: x.price, beds: x.bedrooms, baths: x.bathrooms, sqft: x.squareFootage, lot: x.lotSize, year: x.yearBuilt, type: x.propertyType,
-    dom: x.daysOnMarket, listed: x.listedDate, lat: x.latitude, lon: x.longitude, hoa: x.hoa && x.hoa.fee,
-    office: x.listingOffice && x.listingOffice.name, mls: x.mlsNumber
-  }));
-  return json({ city, max, listings }, 200, {
-    'cache-control': 'public, max-age=1800',
-    'netlify-cdn-cache-control': 'public, durable, s-maxage=43200'
+  const cacheKey = [city.toLowerCase(), type || 'any', beds].join('|').replace(/[^a-z0-9|]/g, '_');
+  let store = null, rec = null;
+  try { store = getStore('listings-cache'); rec = await store.get(cacheKey, { type: 'json' }); } catch (_) {}
+  if (!rec || !Array.isArray(rec.listings) || Date.now() - rec.at > ttl) {
+    try {
+      rec = { at: Date.now(), listings: await fetchAll(key, city, type, beds) };
+      if (store) { try { await store.setJSON(cacheKey, rec); } catch (_) {} }
+    } catch (_) {
+      if (!rec) return json({ error: 'lookup_failed' }, 502);   // serve the last good copy if RentCast hiccups
+    }
+  }
+  const listings = rec.listings.filter(l => !baths || l.baths == null || l.baths >= baths);
+  return json({ city, asOf: new Date(rec.at).toISOString(), count: listings.length, listings }, 200, {
+    'cache-control': 'public, max-age=300'
   });
 };
 
