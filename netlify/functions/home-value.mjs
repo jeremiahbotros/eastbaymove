@@ -4,8 +4,8 @@
 //    (real closed prices from county records, not asking prices).
 // 3) Picks the closest true comparables first — same street / same tract first — then:
 //      similar size (±30%), ±1 bed, ±25 yrs built, same property type; drops $/sq ft outliers.
-// 4) Adjusts each sale for size at half weight (extra square feet don't add value one-for-one),
-//    weights the closest and most recent sales most, and rounds DOWN to the nearest $5,000.
+// 4) Adjusts each sale for size at 25% of its $/sq ft, weights the closest and most recent
+//    sales most, and rounds to the nearest $5,000.
 // Falls back to the AVM's listing comps only if fewer than 3 recorded sales qualify.
 // Setup: Netlify > Site configuration > Environment variables > RENTCAST_API_KEY.
 // Cost: 2 RentCast lookups per NEW address, only when a visitor enters it. Each address is saved for
@@ -19,6 +19,9 @@ const median = a => { const s = a.slice().sort((x, y) => x - y), m = Math.floor(
 const round5k = n => Math.round(n / 5000) * 5000;
 const floor5k = n => Math.floor(n / 5000) * 5000;
 const DAY = 86400000;
+// Size differences are adjusted at 25% of the comp's price per sq ft (about $70–$100/sq ft in most
+// East Bay tracts) — the extra square feet in a bigger model don't add value one-for-one.
+const SIZE_WEIGHT = 0.25;
 const H = { accept: 'application/json' };
 
 function miles(a, b, c, d) {
@@ -70,7 +73,7 @@ export function pickSales(records, sp, lat, lon, now = Date.now()) {
 
 export function valueFromSales(top, sp) {
   const adj = top.map(c => {
-    const sq = c.x.squareFootage, a = (sp.squareFootage && sq) ? c.price + (sp.squareFootage - sq) * (c.price / sq) * 0.5 : c.price;
+    const sq = c.x.squareFootage, a = (sp.squareFootage && sq) ? c.price + (sp.squareFootage - sq) * (c.price / sq) * SIZE_WEIGHT : c.price;
     return { a, w: 1 / (1 + c.score) };
   });
   const wsum = adj.reduce((s, v) => s + v.w, 0);
@@ -78,7 +81,7 @@ export function valueFromSales(top, sp) {
   const med = median(adj.map(v => v.a));
   // weighted toward the closest, most similar sales; median guards against one odd sale
   const base = Math.abs(wavg - med) / med > 0.04 ? med : wavg;
-  return { value: floor5k(base), adjusted: adj.map(v => Math.round(v.a)) };
+  return { value: round5k(base), adjusted: adj.map(v => Math.round(v.a)) };
 }
 
 function pickListingComps(d, sp) {
@@ -105,7 +108,7 @@ export default async (req) => {
   if (!key) return json({ error: 'not_configured' }, 503);
 
   const HDR = { 'cache-control': 'public, max-age=3600', 'netlify-cdn-cache-control': 'public, durable, s-maxage=2592000' };
-  const ck = address.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 150);
+  const ck = 'v2-' + address.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 150);
   let cache = null;
   try { cache = getStore('home-values'); const hit = await cache.get(ck, { type: 'json' }); if (hit && Date.now() - hit.at < 30 * DAY) return json(hit.body, 200, HDR); } catch (_) { cache = null; }
 
@@ -146,7 +149,7 @@ export default async (req) => {
     const lc = pickListingComps(d, sp);
     const closed = lc.filter(c => c.status === 'Inactive');
     let pool = (closed.length >= 3 ? closed : lc).map(c => Object.assign({}, c, { adjPrice: c.status === 'Active' ? c.price * 0.97 : c.price })).slice(0, 6);
-    const adj = pool.filter(c => c.squareFootage && sp.squareFootage).map(c => c.adjPrice + (sp.squareFootage - c.squareFootage) * (c.adjPrice / c.squareFootage) * 0.5);
+    const adj = pool.filter(c => c.squareFootage && sp.squareFootage).map(c => c.adjPrice + (sp.squareFootage - c.squareFootage) * (c.adjPrice / c.squareFootage) * SIZE_WEIGHT);
     compValue = adj.length >= 2 ? median(adj) : 0;
     value = floor5k(compValue ? Math.min(d.price, compValue) : d.price * 0.97);
     low = round5k(value * 0.95); high = round5k(value * 1.04); method = 'listing-comps';
