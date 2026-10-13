@@ -12,6 +12,16 @@ const json = (body, status = 200, extra = {}) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...extra } });
 const TYPES = { 'Single Family Home': 'Single Family', 'Condo': 'Condo', 'Townhouse': 'Townhouse' };
 const DAY = 86400000;
+// Only the 9 Bay Area counties (so "Brentwood" never pulls Brentwood in Los Angeles, etc.)
+const BAY_COUNTIES = ['alameda', 'contra costa', 'marin', 'napa', 'san francisco', 'san mateo', 'santa clara', 'solano', 'sonoma'];
+const inBayArea = x => {
+  const c = String(x.county || '').toLowerCase().replace(/\s+county$/, '').trim();
+  if (c && !BAY_COUNTIES.includes(c)) return false;
+  if (x.latitude != null && x.longitude != null && (x.latitude < 36.85 || x.latitude > 39.0 || x.longitude < -123.7 || x.longitude > -121.2)) return false;
+  const z = String(x.zipCode || '');
+  if (z && !/^9(4\d|5[0-6])\d\d$/.test(z)) return false;   // Bay Area zips are 940xx–956xx (Vacaville/Dixon are 956xx)
+  return true;
+};
 
 async function fetchAll(key, city, type, beds) {
   const pages = Math.min(5, Math.max(1, parseInt(process.env.LISTINGS_MAX_PAGES) || 1));
@@ -30,6 +40,7 @@ async function fetchAll(key, city, type, beds) {
   const now = Date.now(), seen = new Set();
   return all.filter(x => {
     if (!x.price || !x.formattedAddress || x.status !== 'Active' || x.removedDate) return false;
+    if (!inBayArea(x)) return false;
     if (x.lastSeenDate && now - Date.parse(x.lastSeenDate) > 3 * DAY) return false;
     const k = String(x.formattedAddress).toLowerCase(); if (seen.has(k)) return false; seen.add(k);
     return true;
@@ -37,7 +48,7 @@ async function fetchAll(key, city, type, beds) {
     id: x.id, address: x.formattedAddress, line1: x.addressLine1 || String(x.formattedAddress).split(',')[0], city: x.city, zip: x.zipCode,
     price: x.price, beds: x.bedrooms, baths: x.bathrooms, sqft: x.squareFootage, lot: x.lotSize, year: x.yearBuilt, type: x.propertyType,
     dom: x.daysOnMarket, listed: x.listedDate, lat: x.latitude, lon: x.longitude, hoa: x.hoa && x.hoa.fee, lastSeen: x.lastSeenDate,
-    office: x.listingOffice && x.listingOffice.name, mls: x.mlsNumber
+    county: x.county, office: x.listingOffice && x.listingOffice.name, mls: x.mlsNumber
   }));
 }
 
@@ -57,7 +68,7 @@ export default async (req) => {
   const type = TYPES[url.searchParams.get('type')] || '';
   const ttl = Math.max(5, parseInt(process.env.LISTINGS_TTL_MIN) || 1440) * 60000;
 
-  const cacheKey = [city.toLowerCase(), type || 'any', beds].join('|').replace(/[^a-z0-9|]/g, '_');
+  const cacheKey = ['v2', city.toLowerCase(), type || 'any', beds].join('|').replace(/[^a-z0-9|]/g, '_');
   let store = null, rec = null;
   try { store = getStore('listings-cache'); rec = await store.get(cacheKey, { type: 'json' }); } catch (_) {}
   if (!rec || !Array.isArray(rec.listings) || Date.now() - rec.at > ttl) {
