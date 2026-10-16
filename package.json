@@ -2,6 +2,6 @@
   "name": "eastbaymove",
   "private": true,
   "dependencies": {
-    "@netlify/blobs": "^8.1.0"
+    "@netlify/blobs": "^10.5.0"
   }
 }
