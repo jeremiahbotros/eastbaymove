@@ -13,7 +13,7 @@ const ALPHA = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
 const rand = n => [...crypto.getRandomValues(new Uint8Array(n))].map(x => ALPHA[x % ALPHA.length]).join('');
 const newId = () => rand(10);
 export const newToken = () => rand(24);
-const store = () => globalThis.__TEST_STORE || getStore('next-move-plans');
+const store = () => globalThis.__TEST_STORE || getStore({ name: 'next-move-plans', consistency: 'strong' });
 
 export default async (req) => {
   const url = new URL(req.url);
@@ -33,7 +33,7 @@ export default async (req) => {
     if (!rec) return json({ error: 'not_found' }, 404);
     const isAgent = isAgentFor(rec);
     if (sentKey && !isAgent) return json({ error: 'bad_key' }, 401);
-    if (isAgent){ const { editToken, ...safe } = rec; return json(safe); }
+    if (isAgent){ const { editToken, ownerToken, ...safe } = rec; return json(safe); }
     return json({ snapshot: rec.snapshot, override: rec.override || null });
   }
 
@@ -53,12 +53,22 @@ export default async (req) => {
     }
 
     if (!body.snapshot || !body.snapshot.plan) return json({ error: 'bad_request' }, 400);
+    if (id && !ID.test(id)) return json({ error: 'bad_id' }, 400);
     let rec = ID.test(id) ? await s.get(id, { type: 'json' }) : null;
+    if (id && !rec) return json({ error: 'not_found' }, 404);
+    if (rec && (!rec.ownerToken || req.headers.get('x-plan-key') !== rec.ownerToken)) return json({ error: 'bad_key' }, 401);
     const key = rec ? id : newId();
+    const ownerToken = rec ? rec.ownerToken : newToken();
     const snap = Object.assign({}, body.snapshot); delete snap.override;
-    rec = Object.assign({}, rec || {}, { snapshot: snap, contact: body.contact || (rec && rec.contact) || null, created: (rec && rec.created) || Date.now(), updated: Date.now(), editToken: (rec && rec.editToken) || newToken() });
+    let inheritedOverride = null;
+    if (!rec && ID.test(body.sourceId || '')) {
+      const source = await s.get(body.sourceId, { type: 'json' });
+      if (source?.override && source.snapshot?.plan?.address === snap.plan.address && source.override.value === snap.plan.value) inheritedOverride = source.override;
+    }
+    if (rec && snap.plan.address !== rec.snapshot?.plan?.address) delete rec.override;
+    rec = Object.assign({}, rec || {}, { ownerToken, override: rec?.override || inheritedOverride, snapshot: snap, contact: body.contact || (rec && rec.contact) || null, created: (rec && rec.created) || Date.now(), updated: Date.now(), editToken: (rec && rec.editToken) || newToken() });
     await s.setJSON(key, rec);
-    return json({ id: key });
+    return json({ id: key, ...(!id ? { ownerToken } : {}) });
   }
   return json({ error: 'method' }, 405);
 };
