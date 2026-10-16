@@ -33,6 +33,41 @@ function miles(a, b, c, d) {
 const streetOf = a => String(a || '').split(',')[0].replace(/^\d+[A-Za-z]?\s+/, '').toLowerCase().trim();
 const norm = a => String(a || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
+// Hard monthly cap so RentCast can never bill past its free tier (default 48 lookups/month).
+// Change with the Netlify variable RENTCAST_MONTHLY_LIMIT. Counted in Netlify Blobs.
+export async function takeLookups(n) {
+  const raw = process.env.RENTCAST_MONTHLY_LIMIT;
+  const limit = raw === undefined ? 48 : Math.max(0, Math.min(48, Number.isFinite(Number(raw)) ? Math.floor(Number(raw)) : 0));
+  if (n !== 2 || limit < n) return false;
+  const month = new Date().toISOString().slice(0, 7);
+  try {
+    const st = globalThis.__TEST_USAGE || getStore({ name: 'rentcast-usage', consistency: 'strong' });
+    // Preserve usage already counted by the old deployment, freezing it on first use.
+    const baselineKey = month + '/baseline';
+    let baseline = await st.get(baselineKey, { type: 'json' });
+    if (!baseline) {
+      const legacy = await st.get(month, { type: 'json' });
+      const used = Math.max(0, Math.ceil(Number(legacy?.used) || 0));
+      await st.setJSON(baselineKey, { used }, { onlyIfNew: true });
+      baseline = await st.get(baselineKey, { type: 'json' });
+      if (!baseline) return false;
+    }
+    // Account for requests made by the older production deployment while this
+    // version is being previewed, without reopening already claimed slots.
+    const legacyNow = await st.get(month, { type: 'json' });
+    const ceiling = limit - Math.max(0, (Number(legacyNow?.used) || 0) - baseline.used);
+    for (let i = baseline.used; i + n <= ceiling; i += n) {
+      const claimKey = month + '/reservation-' + i, owner = crypto.randomUUID();
+      const result = await st.setJSON(claimKey, { lookups: n, owner }, { onlyIfNew: true });
+      // Verify ownership as well: failed writes must never authorize provider calls.
+      if (result?.modified === true) {
+        const claimed = await st.get(claimKey, { type: 'json' });
+        return claimed?.owner === owner;
+      }
+    }
+    return false;
+  } catch (_) { return false; }
+}
 async function rc(key, path, params) {
   const r = await fetch('https://api.rentcast.io/v1/' + path + '?' + new URLSearchParams(params), { headers: { ...H, 'X-Api-Key': key } });
   if (!r.ok) return { error: r.status };
@@ -108,14 +143,17 @@ export default async (req) => {
   if (!key) return json({ error: 'not_configured' }, 503);
 
   const HDR = { 'cache-control': 'public, max-age=3600', 'netlify-cdn-cache-control': 'public, durable, s-maxage=2592000' };
-  const ck = 'v2-' + address.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 150);
+  const ck = 'v3-' + address.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 150);
   let cache = null;
   try { cache = getStore('home-values'); const hit = await cache.get(ck, { type: 'json' }); if (hit && Date.now() - hit.at < 30 * DAY) return json(hit.body, 200, HDR); } catch (_) { cache = null; }
 
+  // Each new address costs 2 lookups (home facts + recorded sales). Over the cap -> the page asks for beds/baths/sq ft instead.
+  if (!(await takeLookups(2))) return json({ error: 'monthly_limit' }, 429);
   let res;
   try { res = await rc(key, 'avm/value', { address, compCount: '25', maxRadius: '1', daysOld: '540' }); }
   catch (_) { return json({ error: 'lookup_failed' }, 502); }
   if (!res.data) return json({ error: 'lookup_failed', status: res.error }, res.error === 404 ? 404 : 502);
+  if (!(Number.isFinite(res.data.price) && res.data.price > 0)) return json({ error: 'invalid_value' }, 502);
   const d = res.data, sp = Object.assign({ formattedAddress: address }, d.subjectProperty || {});
   const lat = sp.latitude != null ? sp.latitude : d.latitude, lon = sp.longitude != null ? sp.longitude : d.longitude;
 

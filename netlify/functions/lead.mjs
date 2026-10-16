@@ -25,7 +25,7 @@ export default async (req) => {
   const m = String(data.agent_link || '').match(/#agent-edit=([A-Za-z0-9]{8,16})(?![A-Za-z0-9.])/);
   if (m) {
     try {
-      const st = globalThis.__TEST_STORE || getStore('next-move-plans');
+      const st = globalThis.__TEST_STORE || getStore({ name: 'next-move-plans', consistency: 'strong' });
       const rec = await st.get(m[1], { type: 'json' });
       if (rec) {
         if (!rec.editToken) { rec.editToken = [...crypto.getRandomValues(new Uint8Array(24))].map(x => 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789'[x % 56]).join(''); await st.setJSON(m[1], rec); }
